@@ -1,126 +1,188 @@
 #!/usr/bin/env python3
-"""kvstore - Persistent key-value store with namespaces.
+"""kvstore - Persistent key-value store with TTL and namespaces.
 
-One file. Zero deps. Remember things.
-
-Usage:
-  kvstore.py set mykey "some value"     → store a value
-  kvstore.py get mykey                  → retrieve it
-  kvstore.py del mykey                  → delete it
-  kvstore.py list                       → list all keys
-  kvstore.py search "pattern"           → search keys/values
-  kvstore.py export                     → dump as JSON
-  kvstore.py import data.json           → load from JSON
-  kvstore.py -n myapp set key val       → namespaced store
+SQLite-backed CLI key-value store. Zero dependencies.
 """
 
 import argparse
-import fnmatch
 import json
 import os
+import sqlite3
 import sys
 import time
 
-STORE_DIR = os.path.expanduser("~/.local/share/kvstore")
+
+DB_PATH = os.environ.get("KVSTORE_DB", os.path.expanduser("~/.kvstore.db"))
 
 
-def store_path(ns: str) -> str:
-    os.makedirs(STORE_DIR, exist_ok=True)
-    return os.path.join(STORE_DIR, f"{ns}.json")
+def get_db():
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute("""CREATE TABLE IF NOT EXISTS kv (
+        ns TEXT DEFAULT 'default',
+        key TEXT NOT NULL,
+        value TEXT,
+        created_at REAL,
+        expires_at REAL,
+        PRIMARY KEY (ns, key)
+    )""")
+    db.commit()
+    return db
 
 
-def load(ns: str) -> dict:
-    try:
-        with open(store_path(ns)) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+def prune(db):
+    db.execute("DELETE FROM kv WHERE expires_at IS NOT NULL AND expires_at < ?", (time.time(),))
+    db.commit()
 
 
-def save(ns: str, data: dict):
-    with open(store_path(ns), "w") as f:
-        json.dump(data, f, indent=2)
+def parse_ttl(s):
+    if not s:
+        return None
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if s[-1] in units:
+        return float(s[:-1]) * units[s[-1]]
+    return float(s)
 
 
 def cmd_set(args):
-    data = load(args.ns)
-    data[args.key] = {"value": args.value, "updated": time.time()}
-    save(args.ns, data)
-    print(f"✅ {args.key} = {args.value}")
+    db = get_db()
+    prune(db)
+    now = time.time()
+    ttl = parse_ttl(args.ttl)
+    expires = now + ttl if ttl else None
+    db.execute("INSERT OR REPLACE INTO kv (ns, key, value, created_at, expires_at) VALUES (?,?,?,?,?)",
+               (args.ns, args.key, args.value, now, expires))
+    db.commit()
+    print(f"OK")
+
 
 def cmd_get(args):
-    data = load(args.ns)
-    entry = data.get(args.key)
-    if entry:
-        print(entry["value"])
+    db = get_db()
+    prune(db)
+    row = db.execute("SELECT value FROM kv WHERE ns=? AND key=?", (args.ns, args.key)).fetchone()
+    if row:
+        print(row["value"])
     else:
-        print(f"Key '{args.key}' not found", file=sys.stderr)
-        return 1
+        if args.default is not None:
+            print(args.default)
+        else:
+            sys.exit(1)
+
 
 def cmd_del(args):
-    data = load(args.ns)
-    if args.key in data:
-        del data[args.key]
-        save(args.ns, data)
-        print(f"✅ Deleted '{args.key}'")
-    else:
-        print(f"Key '{args.key}' not found", file=sys.stderr)
-        return 1
+    db = get_db()
+    n = db.execute("DELETE FROM kv WHERE ns=? AND key=?", (args.ns, args.key)).rowcount
+    db.commit()
+    print(f"Deleted {n}")
+
 
 def cmd_list(args):
-    data = load(args.ns)
-    if not data:
-        print("(empty)")
-        return
-    for k, v in sorted(data.items()):
-        val = str(v["value"])[:60]
-        print(f"  {k:30s} {val}")
+    db = get_db()
+    prune(db)
+    rows = db.execute("SELECT key, value, expires_at FROM kv WHERE ns=? ORDER BY key", (args.ns,)).fetchall()
+    if args.json:
+        d = {r["key"]: r["value"] for r in rows}
+        print(json.dumps(d, indent=2))
+    else:
+        for r in rows:
+            ttl_str = ""
+            if r["expires_at"]:
+                remaining = r["expires_at"] - time.time()
+                if remaining > 0:
+                    ttl_str = f" (TTL: {int(remaining)}s)"
+            print(f"  {r['key']} = {r['value']}{ttl_str}")
+        print(f"\n{len(rows)} keys in '{args.ns}'", file=sys.stderr)
 
-def cmd_search(args):
-    data = load(args.ns)
-    pattern = args.pattern.lower()
-    found = 0
-    for k, v in data.items():
-        if pattern in k.lower() or pattern in str(v["value"]).lower():
-            print(f"  {k:30s} {str(v['value'])[:60]}")
-            found += 1
-    if not found:
-        print(f"No matches for '{args.pattern}'")
+
+def cmd_ns(args):
+    db = get_db()
+    prune(db)
+    rows = db.execute("SELECT ns, COUNT(*) as c FROM kv GROUP BY ns ORDER BY ns").fetchall()
+    for r in rows:
+        print(f"  {r['ns']}: {r['c']} keys")
+
 
 def cmd_export(args):
-    data = load(args.ns)
-    simple = {k: v["value"] for k, v in data.items()}
-    print(json.dumps(simple, indent=2))
+    db = get_db()
+    prune(db)
+    rows = db.execute("SELECT ns, key, value FROM kv WHERE ns=? ORDER BY key", (args.ns,)).fetchall()
+    d = {r["key"]: r["value"] for r in rows}
+    print(json.dumps(d, indent=2))
+
 
 def cmd_import(args):
-    with open(args.file) as f:
-        incoming = json.load(f)
-    data = load(args.ns)
-    for k, v in incoming.items():
-        data[k] = {"value": v, "updated": time.time()}
-    save(args.ns, data)
-    print(f"✅ Imported {len(incoming)} keys")
+    db = get_db()
+    data = json.load(open(args.file))
+    now = time.time()
+    count = 0
+    for k, v in data.items():
+        db.execute("INSERT OR REPLACE INTO kv (ns, key, value, created_at) VALUES (?,?,?,?)",
+                   (args.ns, k, str(v), now))
+        count += 1
+    db.commit()
+    print(f"Imported {count} keys into '{args.ns}'")
+
+
+def cmd_flush(args):
+    db = get_db()
+    if args.ns != "default":
+        n = db.execute("DELETE FROM kv WHERE ns=?", (args.ns,)).rowcount
+    else:
+        n = db.execute("DELETE FROM kv").rowcount
+    db.commit()
+    print(f"Flushed {n} keys")
+
+
+def cmd_stats(args):
+    db = get_db()
+    prune(db)
+    total = db.execute("SELECT COUNT(*) as c FROM kv").fetchone()["c"]
+    namespaces = db.execute("SELECT COUNT(DISTINCT ns) as c FROM kv").fetchone()["c"]
+    expiring = db.execute("SELECT COUNT(*) as c FROM kv WHERE expires_at IS NOT NULL").fetchone()["c"]
+    size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+    print(f"  Keys: {total}")
+    print(f"  Namespaces: {namespaces}")
+    print(f"  With TTL: {expiring}")
+    print(f"  DB size: {size} bytes")
+
 
 def main():
     p = argparse.ArgumentParser(description="Persistent key-value store")
-    p.add_argument("-n", "--ns", default="default", help="Namespace")
+    p.add_argument("--ns", default="default", help="Namespace")
     sub = p.add_subparsers(dest="cmd")
 
-    s = sub.add_parser("set"); s.add_argument("key"); s.add_argument("value")
-    s = sub.add_parser("get"); s.add_argument("key")
-    s = sub.add_parser("del"); s.add_argument("key")
-    sub.add_parser("list")
-    s = sub.add_parser("search"); s.add_argument("pattern")
-    sub.add_parser("export")
-    s = sub.add_parser("import"); s.add_argument("file")
+    sp = sub.add_parser("set", help="Set a key")
+    sp.add_argument("key")
+    sp.add_argument("value")
+    sp.add_argument("--ttl", help="Time to live (e.g. 30s, 5m, 1h, 7d)")
+
+    gp = sub.add_parser("get", help="Get a key")
+    gp.add_argument("key")
+    gp.add_argument("-d", "--default", help="Default if missing")
+
+    dp = sub.add_parser("del", help="Delete a key")
+    dp.add_argument("key")
+
+    lp = sub.add_parser("list", help="List keys")
+    lp.add_argument("--json", action="store_true")
+
+    sub.add_parser("ns", help="List namespaces")
+    sub.add_parser("stats", help="Store statistics")
+
+    ep = sub.add_parser("export", help="Export namespace as JSON")
+    ip = sub.add_parser("import", help="Import JSON into namespace")
+    ip.add_argument("file")
+
+    fp = sub.add_parser("flush", help="Delete all keys (or namespace)")
 
     args = p.parse_args()
     if not args.cmd:
         p.print_help()
-        return 1
-    cmds = {"set": cmd_set, "get": cmd_get, "del": cmd_del, "list": cmd_list,
-            "search": cmd_search, "export": cmd_export, "import": cmd_import}
-    return cmds[args.cmd](args) or 0
+        sys.exit(1)
+    {"set": cmd_set, "get": cmd_get, "del": cmd_del, "list": cmd_list,
+     "ns": cmd_ns, "export": cmd_export, "import": cmd_import,
+     "flush": cmd_flush, "stats": cmd_stats}[args.cmd](args)
+
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
